@@ -165,6 +165,7 @@ async function processPendingUploads() {
     console.log(`- Total Images Processed & Saved: ${processedCount}`);
     console.log(`- Ephemeral Firestore Documents Purged: ${deletedCount}`);
     console.log('====================================================\n');
+    process.exit(0);
   } catch (error) {
     console.error('Fatal error during pending uploads processing:', error);
     process.exit(1);

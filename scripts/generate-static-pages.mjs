@@ -17,42 +17,89 @@
  */
 
 import admin from 'firebase-admin';
-import { getFirestore } from 'firebase-admin/firestore';
+import { getFirestore as getAdminFirestore } from 'firebase-admin/firestore';
+import { initializeApp as initClientApp } from 'firebase/app';
+import { 
+  getFirestore as getClientFirestore, 
+  collection as clientCollection, 
+  getDocs as clientGetDocs, 
+  query as clientQuery, 
+  where as clientWhere 
+} from 'firebase/firestore';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as dotenv from 'dotenv';
 dotenv.config();
 
 // ==========================================
-// 1. Firebase Admin Initialization
+// 1. Unified Firebase Data Layer (Admin + Client Fallback)
 // ==========================================
-function initFirebaseAdmin() {
-  const fbAdmin = admin.default || admin;
-  if (fbAdmin.apps && fbAdmin.apps.length > 0) {
-    return fbAdmin.app();
-  }
-
-  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+function parseServiceAccount(raw) {
+  if (!raw || !raw.trim()) return null;
+  const trimmed = raw.trim();
+  try {
+    return JSON.parse(trimmed);
+  } catch (e) {
     try {
-      const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-      return fbAdmin.initializeApp({
-        credential: fbAdmin.credential.cert(serviceAccount),
-        projectId: serviceAccount.project_id || process.env.VITE_FIREBASE_PROJECT_ID || 'portfoliohubs-8d806'
-      });
-    } catch (err) {
-      console.warn('⚠️ Could not parse FIREBASE_SERVICE_ACCOUNT JSON. Falling back:', err.message);
+      const decoded = Buffer.from(trimmed, 'base64').toString('utf-8');
+      return JSON.parse(decoded);
+    } catch (e2) {
+      return null;
+    }
+  }
+}
+
+function initFirebaseBackend() {
+  const fbAdmin = admin.default || admin;
+  
+  // 1. Try Firebase Admin with Service Account
+  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    const serviceAccount = parseServiceAccount(process.env.FIREBASE_SERVICE_ACCOUNT);
+    if (serviceAccount && serviceAccount.project_id) {
+      try {
+        const adminApp = fbAdmin.apps && fbAdmin.apps.length > 0 
+          ? fbAdmin.app() 
+          : fbAdmin.initializeApp({
+              credential: fbAdmin.credential.cert(serviceAccount),
+              projectId: serviceAccount.project_id
+            });
+        console.log('🔒 Firebase Data Layer: Initialized with Firebase Admin SDK (Full Access).');
+        return { mode: 'admin', adminDb: getAdminFirestore(adminApp) };
+      } catch (err) {
+        console.warn('⚠️ Admin SDK initialization with service account failed:', err.message);
+      }
     }
   }
 
   if (process.env.GOOGLE_APPLICATION_CREDENTIALS && fs.existsSync(process.env.GOOGLE_APPLICATION_CREDENTIALS)) {
-    return fbAdmin.initializeApp({
-      credential: fbAdmin.credential.applicationDefault(),
-      projectId: process.env.VITE_FIREBASE_PROJECT_ID || 'portfoliohubs-8d806'
-    });
+    try {
+      const adminApp = fbAdmin.apps && fbAdmin.apps.length > 0 
+        ? fbAdmin.app() 
+        : fbAdmin.initializeApp({
+            credential: fbAdmin.credential.applicationDefault(),
+            projectId: process.env.VITE_FIREBASE_PROJECT_ID || 'portfoliohubs-8d806'
+          });
+      console.log('🔒 Firebase Data Layer: Initialized with ADC Application Default Credentials.');
+      return { mode: 'admin', adminDb: getAdminFirestore(adminApp) };
+    } catch (err) {
+      console.warn('⚠️ Admin SDK initialization with ADC failed:', err.message);
+    }
   }
 
-  const projectId = process.env.VITE_FIREBASE_PROJECT_ID || 'portfoliohubs-8d806';
-  return fbAdmin.initializeApp({ projectId });
+  // 2. Client SDK Fallback (Allows reading approved/published doctors and public content safely without ADC errors)
+  const firebaseConfig = {
+    apiKey: process.env.VITE_FIREBASE_API_KEY || 'AIzaSyAosm8TMAw0Mjqs_Rtzi4ezCFoJosDWPYU',
+    authDomain: process.env.VITE_FIREBASE_AUTH_DOMAIN || 'portfoliohubs-8d806.firebaseapp.com',
+    projectId: process.env.VITE_FIREBASE_PROJECT_ID || 'portfoliohubs-8d806',
+    storageBucket: process.env.VITE_FIREBASE_STORAGE_BUCKET || 'portfoliohubs-8d806.firebasestorage.app',
+    messagingSenderId: process.env.VITE_FIREBASE_MESSAGING_SENDER_ID || '825482910482',
+    appId: process.env.VITE_FIREBASE_APP_ID || '1:825482910482:web:9b32a10e428cfa10'
+  };
+
+  const clientApp = initClientApp(firebaseConfig);
+  const clientDb = getClientFirestore(clientApp);
+  console.log('🌐 Firebase Data Layer: Initialized with Firebase Client SDK (Public & Published Data).');
+  return { mode: 'client', clientDb };
 }
 
 // ==========================================
@@ -1616,13 +1663,7 @@ async function runStaticGeneration() {
   console.log('PortfolioHubs - Static Generation & SEO Build Engine');
   console.log('====================================================\n');
 
-  let db = null;
-  try {
-    const app = initFirebaseAdmin();
-    db = getFirestore(app);
-  } catch (err) {
-    console.warn('⚠️ Could not initialize Firebase Admin SDK:', err.message);
-  }
+  const backend = initFirebaseBackend();
   const baseUrl = process.env.BASE_URL || 'https://portfoliohubs.github.io';
   const publicDir = path.join(process.cwd(), 'public');
   ensureDir(publicDir);
@@ -1634,84 +1675,118 @@ async function runStaticGeneration() {
   let deletedPendingDocsCount = 0;
 
   try {
-    // Step 1: Process pending image uploads
+    // Step 1: Process pending image uploads (Admin Mode only)
     console.log('Step 1: Checking ephemeral pending_uploads collection...');
-    try {
-      const pendingSnap = await db.collectionGroup('pending_uploads').get();
-      console.log(`Found ${pendingSnap.size} pending image upload document(s).`);
+    if (backend.mode === 'admin') {
+      try {
+        const pendingSnap = await backend.adminDb.collectionGroup('pending_uploads').get();
+        console.log(`Found ${pendingSnap.size} pending image upload document(s).`);
 
-      for (const docSnap of pendingSnap.docs) {
-        const data = docSnap.data();
-        const { uid, targetType, targetId, fileName, base64 } = data;
-        if (!uid || !base64) {
+        for (const docSnap of pendingSnap.docs) {
+          const data = docSnap.data();
+          const { uid, targetType, targetId, fileName, base64 } = data;
+          if (!uid || !base64) {
+            await docSnap.ref.delete();
+            continue;
+          }
+
+          let slug = 'dr-' + uid.substring(0, 8);
+          const userSnap = await backend.adminDb.collection('users').doc(uid).get();
+          if (userSnap.exists) {
+            const u = userSnap.data();
+            slug = u.username || u.slug || ('dr-' + slugify(u.fullName || 'doctor'));
+          }
+
+          const safeName = fileName || `${targetType}_${Date.now()}.webp`;
+          const subFolder = targetType === 'case' ? 'cases' : 'profile';
+          const destRelPath = `assets/dr/${slug}/${subFolder}/${safeName}`;
+          const destFullPath = path.join(publicDir, destRelPath);
+
+          writeBase64ToFile(destFullPath, base64);
+          processedImagesCount++;
+
+          if (targetType === 'case' && targetId) {
+            await backend.adminDb.collection('users').doc(uid).collection('cases').doc(targetId).set({
+              photoPath: destRelPath,
+              preview: destRelPath,
+              photo: destRelPath,
+              updatedAt: new Date().toISOString()
+            }, { merge: true });
+          } else if (targetType === 'profile') {
+            await backend.adminDb.collection('users').doc(uid).set({
+              profilePhotoPath: destRelPath,
+              profilePhoto: destRelPath,
+              profilePreview: destRelPath,
+              updatedAt: new Date().toISOString()
+            }, { merge: true });
+          }
+
           await docSnap.ref.delete();
-          continue;
+          deletedPendingDocsCount++;
         }
-
-        let slug = 'dr-' + uid.substring(0, 8);
-        const userSnap = await db.collection('users').doc(uid).get();
-        if (userSnap.exists) {
-          const u = userSnap.data();
-          slug = u.username || u.slug || ('dr-' + slugify(u.fullName || 'doctor'));
-        }
-
-        const safeName = fileName || `${targetType}_${Date.now()}.webp`;
-        const subFolder = targetType === 'case' ? 'cases' : 'profile';
-        const destRelPath = `assets/dr/${slug}/${subFolder}/${safeName}`;
-        const destFullPath = path.join(publicDir, destRelPath);
-
-        writeBase64ToFile(destFullPath, base64);
-        processedImagesCount++;
-
-        if (targetType === 'case' && targetId) {
-          await db.collection('users').doc(uid).collection('cases').doc(targetId).set({
-            photoPath: destRelPath,
-            preview: destRelPath,
-            photo: destRelPath,
-            updatedAt: new Date().toISOString()
-          }, { merge: true });
-        } else if (targetType === 'profile') {
-          await db.collection('users').doc(uid).set({
-            profilePhotoPath: destRelPath,
-            profilePhoto: destRelPath,
-            profilePreview: destRelPath,
-            updatedAt: new Date().toISOString()
-          }, { merge: true });
-        }
-
-        await docSnap.ref.delete();
-        deletedPendingDocsCount++;
+      } catch (err) {
+        console.warn('⚠️ Step 1 skipped:', err.message);
       }
-    } catch (err) {
-      console.warn('⚠️ Step 1 skipped (no Firestore admin access):', err.message);
+    } else {
+      console.log('ℹ️ Running in Client mode: Ephemeral pending uploads processing requires Admin credentials (FIREBASE_SERVICE_ACCOUNT secret). Proceeding with static page generation.');
     }
 
     // Step 2: Fetch approved doctors and generate pages + 4 articles
     console.log('\nStep 2: Fetching approved doctors from Firestore...');
+    const doctorsList = [];
     try {
-      const usersSnap = await db.collection('users').get();
-      
-      for (const userDoc of usersSnap.docs) {
-        const doctor = userDoc.data();
-        const uid = userDoc.id;
-
-        const isApproved = doctor.status === 'published' || doctor.status === 'approved';
-        const isActive = doctor.active !== false;
-
-        if (!isApproved || !isActive) {
-          continue;
+      if (backend.mode === 'admin') {
+        const usersSnap = await backend.adminDb.collection('users').get();
+        for (const docSnap of usersSnap.docs) {
+          const doctor = docSnap.data();
+          const isApproved = doctor.status === 'published' || doctor.status === 'approved';
+          const isActive = doctor.active !== false;
+          if (isApproved && isActive) {
+            doctorsList.push({ uid: docSnap.id, doctor });
+          }
         }
+      } else {
+        // Query approved/published doctors using client SDK (passes firestore security rules seamlessly)
+        const q = clientQuery(
+          clientCollection(backend.clientDb, 'users'),
+          clientWhere('status', 'in', ['approved', 'published'])
+        );
+        const snap = await clientGetDocs(q);
+        for (const docSnap of snap.docs) {
+          const doctor = docSnap.data();
+          if (doctor.active !== false) {
+            doctorsList.push({ uid: docSnap.id, doctor });
+          }
+        }
+      }
 
+      console.log(`Found ${doctorsList.length} approved/published doctor(s) to generate.`);
+
+      for (const { uid, doctor } of doctorsList) {
         const username = doctor.username || doctor.slug || slugify(doctor.fullName || 'doctor');
         const citySlug = slugify(doctor.locationAddress || doctor.locationAddressAr || 'city');
         console.log(`\n> Generating static portfolio & 4 SEO articles for: ${doctor.fullName || doctor.fullNameAr} (dr/${username})...`);
 
         // Clinical cases from subcollection
-        const casesSnap = await db.collection('users').doc(uid).collection('cases').orderBy('sortOrder', 'asc').get();
         let cases = [];
-        if (!casesSnap.empty) {
-          cases = casesSnap.docs.map(d => ({ id: d.id, ...d.data() }));
-        } else if (Array.isArray(doctor.cases) && doctor.cases.length > 0) {
+        try {
+          if (backend.mode === 'admin') {
+            const casesSnap = await backend.adminDb.collection('users').doc(uid).collection('cases').orderBy('sortOrder', 'asc').get();
+            if (!casesSnap.empty) {
+              cases = casesSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+            }
+          } else {
+            const casesSnap = await clientGetDocs(clientCollection(backend.clientDb, 'users', uid, 'cases'));
+            if (!casesSnap.empty) {
+              cases = casesSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+              cases.sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0));
+            }
+          }
+        } catch (caseErr) {
+          console.warn(`  ⚠️ Could not fetch cases subcollection for ${username}:`, caseErr.message);
+        }
+
+        if (cases.length === 0 && Array.isArray(doctor.cases) && doctor.cases.length > 0) {
           cases = doctor.cases;
         }
 
@@ -1740,7 +1815,7 @@ async function runStaticGeneration() {
         publishedDoctorEntries.push({ slug: username, citySlug });
       }
     } catch (err) {
-      console.warn('⚠️ Step 2 skipped (no Firestore admin access):', err.message);
+      console.warn('⚠️ Step 2 failed:', err.message);
     }
 
     // Step 4: Generate Public Blog Pages & Copy Markdown
@@ -1765,10 +1840,17 @@ async function runStaticGeneration() {
     // Fetch published blog overrides from Firestore
     const blogOverrides = {};
     try {
-      const blogSnap = await db.collection('blog_articles').get();
-      blogSnap.forEach(d => {
-        blogOverrides[d.id] = d.data();
-      });
+      if (backend.mode === 'admin') {
+        const blogSnap = await backend.adminDb.collection('blog_articles').get();
+        blogSnap.forEach(d => {
+          blogOverrides[d.id] = d.data();
+        });
+      } else {
+        const blogSnap = await clientGetDocs(clientCollection(backend.clientDb, 'blog_articles'));
+        blogSnap.forEach(d => {
+          blogOverrides[d.id] = d.data();
+        });
+      }
     } catch (err) {
       console.warn('⚠️ Could not connect to Firestore for blog_articles overrides (using defaults):', err.message);
     }
@@ -1813,6 +1895,7 @@ async function runStaticGeneration() {
     console.log(`- Static WebP Images Saved: ${processedImagesCount}`);
     console.log(`- Ephemeral Docs Purged: ${deletedPendingDocsCount}`);
     console.log('====================================================\n');
+    process.exit(0);
 
   } catch (error) {
     console.error('Fatal error during generation:', error);
